@@ -1,0 +1,4 @@
+session     [default=ignore success=1] pam_succeed_if.so quiet uid ne 0
+session     [default=2]   pam_smask.so 0000
+session     [default=ignore success=1] pam_succeed_if.so quiet uid < 1000
+session     optional      pam_smask.so 0007

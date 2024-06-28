@@ -1,0 +1,99 @@
+DISTRIBUTION STATEMENT A. Approved for public release. Distribution is unlimited.
+
+This material is based upon work supported by the Department of the Air Force under
+Air Force Contract No. FA8702-15-D-0001. Any opinions, findings, conclusions or
+recommendations expressed in this material are those of the author(s) and do not
+necessarily reflect the views of the Department of the Air Force.
+
+(c) 2024 Massachusetts Institute of Technology.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 as
+published by the Free Software Foundation;
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS
+Part 252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice,
+U.S. Government rights in this work are defined by DFARS 252.227-7013 or
+DFARS 252.227-7014 as detailed above. Use of this work other than as specifically
+authorized by the U.S. Government may violate any copyrights that exist in this work.
+--- linux-5.10.126/fs/posix_acl.c	2022-06-28 18:35:10.069705638 -0400
++++ linux-5.10.126/fs/posix_acl.c	2022-06-28 18:36:30.193703656 -0400
+@@ -764,6 +764,42 @@ int posix_acl_restrict_smask_xattr(void
+ 	return 0;
+ }
+ 
++// Implements a rule that unprivileged users may only set ACLs for groups that they are a member of
++int posix_acl_restrict_ingroup_xattr(void *value, size_t size)
++{
++	struct posix_acl_xattr_header *header = value;
++	struct posix_acl_xattr_entry *entry = (void *)(header + 1), *end;
++	int count;
++
++	if (!value)
++		return 0;
++	if (size < sizeof(struct posix_acl_xattr_header))
++		return -EINVAL;
++	if (header->a_version != cpu_to_le32(POSIX_ACL_XATTR_VERSION))
++		return -EOPNOTSUPP;
++
++	count = posix_acl_xattr_count(size);
++	if (count < 0)
++		return -EINVAL;
++	if (count == 0)
++		return 0;
++
++	for (end = entry + count; entry != end; entry++) {
++		switch(le16_to_cpu(entry->e_tag)) {
++			case ACL_USER:
++				return -EPERM;
++				break;
++			case ACL_GROUP:
++				if (!in_group_p(make_kgid(&init_user_ns, le32_to_cpu(entry->e_id))))
++					return -EPERM;
++				break;
++			default:
++				break;
++		}
++	}
++	return 0;
++}
++
+ /*
+  * Convert from extended attribute to in-memory representation.
+  */
+--- linux-5.10.126/fs/xattr.c	2022-06-28 18:37:54.101701581 -0400
++++ linux-5.10.126/fs/xattr.c	2022-06-28 18:38:53.705700107 -0400
+@@ -542,6 +542,11 @@ setxattr(struct dentry *d, const char __
+ 				if (error < 0)
+ 					goto out;
+ 			}
++			if (!capable(CAP_CHOWN)) {
++				error = posix_acl_restrict_ingroup_xattr(kvalue, size);
++				if (error < 0)
++					goto out;
++			}
+ 		}
+ 		else if (strcmp(kname, XATTR_NAME_CAPS) == 0) {
+ 			error = cap_convert_nscap(d, &kvalue, size);
+--- linux-5.10.126/include/linux/posix_acl_xattr.h	2022-06-28 18:39:18.373699496 -0400
++++ linux-5.10.126/include/linux/posix_acl_xattr.h	2022-06-28 18:39:40.873698940 -0400
+@@ -36,6 +36,7 @@ posix_acl_xattr_count(size_t size)
+ void posix_acl_fix_xattr_from_user(void *value, size_t size);
+ void posix_acl_fix_xattr_to_user(void *value, size_t size);
+ int posix_acl_restrict_smask_xattr(void *value, size_t size);
++int posix_acl_restrict_ingroup_xattr(void *value, size_t size);
+ #else
+ static inline void posix_acl_fix_xattr_from_user(void *value, size_t size)
+ {

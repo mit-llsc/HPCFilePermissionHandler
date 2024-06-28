@@ -1,0 +1,307 @@
+DISTRIBUTION STATEMENT A. Approved for public release. Distribution is unlimited.
+
+This material is based upon work supported by the Department of the Air Force under
+Air Force Contract No. FA8702-15-D-0001. Any opinions, findings, conclusions or
+recommendations expressed in this material are those of the author(s) and do not
+necessarily reflect the views of the Department of the Air Force.
+
+(c) 2024 Massachusetts Institute of Technology.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 as
+published by the Free Software Foundation;
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+Delivered to the U.S. Government with Unlimited Rights, as defined in DFARS
+Part 252.227-7013 or 7014 (Feb 2014). Notwithstanding any copyright notice,
+U.S. Government rights in this work are defined by DFARS 252.227-7013 or
+DFARS 252.227-7014 as detailed above. Use of this work other than as specifically
+authorized by the U.S. Government may violate any copyrights that exist in this work.
+--- linux-5.10.126/fs/fs_struct.c	2022-06-28 18:03:21.685752839 -0400
++++ linux-5.10.126/fs/fs_struct.c	2022-06-28 18:04:14.581751531 -0400
+@@ -125,6 +125,7 @@ struct fs_struct *copy_fs_struct(struct
+ 		path_get(&fs->root);
+ 		fs->pwd = old->pwd;
+ 		path_get(&fs->pwd);
++		fs->smask = old->smask;
+ 		spin_unlock(&old->lock);
+ 	}
+ 	return fs;
+@@ -159,6 +160,12 @@ int current_umask(void)
+ }
+ EXPORT_SYMBOL(current_umask);
+ 
++int current_smask(void)
++{
++	return current->fs->smask;
++}
++EXPORT_SYMBOL(current_smask);
++
+ /* to be mentioned only in INIT_TASK */
+ struct fs_struct init_fs = {
+ 	.users		= 1,
+--- linux-5.10.126/fs/open.c	2022-06-28 18:04:54.737750537 -0400
++++ linux-5.10.126/fs/open.c	2022-06-28 18:06:09.245748695 -0400
+@@ -568,7 +568,11 @@ int chmod_common(const struct path *path
+ 	struct inode *inode = path->dentry->d_inode;
+ 	struct inode *delegated_inode = NULL;
+ 	struct iattr newattrs;
+-	int error;
++	int error, smask;
++
++	smask = current_smask();
++	if ((mode & smask) && !capable(CAP_FOWNER))
++		mode &= ~smask;
+ 
+ 	error = mnt_want_write(path->mnt);
+ 	if (error)
+--- linux-5.10.126/fs/posix_acl.c	2022-06-28 18:07:12.917747120 -0400
++++ linux-5.10.126/fs/posix_acl.c	2022-06-28 18:12:31.033739252 -0400
+@@ -313,7 +313,7 @@ posix_acl_equiv_mode(const struct posix_
+ 		}
+ 	}
+         if (mode_p)
+-                *mode_p = (*mode_p & ~S_IRWXUGO) | mode;
++		*mode_p = ((*mode_p & ~S_IRWXUGO) | mode) & ~current_smask();
+         return not_equiv;
+ }
+ EXPORT_SYMBOL(posix_acl_equiv_mode);
+@@ -463,7 +463,7 @@ static int posix_acl_create_masq(struct
+ 		mode &= (group_obj->e_perm << 3) | ~S_IRWXG;
+ 	}
+ 
+-	*mode_p = (*mode_p & ~S_IRWXUGO) | mode;
++	*mode_p = ((*mode_p & ~S_IRWXUGO) | mode) & ~current_smask();
+         return not_equiv;
+ }
+ 
+@@ -521,6 +521,8 @@ __posix_acl_create(struct posix_acl **ac
+ 	struct posix_acl *clone = posix_acl_clone(*acl, gfp);
+ 	int err = -ENOMEM;
+ 	if (clone) {
++		*mode_p *= ~current_smask();
++
+ 		err = posix_acl_create_masq(clone, mode_p);
+ 		if (err < 0) {
+ 			posix_acl_release(clone);
+@@ -721,6 +723,47 @@ void posix_acl_fix_xattr_to_user(void *v
+ 	posix_acl_fix_xattr_userns(user_ns, &init_user_ns, value, size);
+ }
+ 
++// Implements smask on ACLs
++int posix_acl_restrict_smask_xattr(void *value, size_t size)
++{
++	struct posix_acl_xattr_header *header = value;
++	struct posix_acl_xattr_entry *entry = (void *)(header + 1), *end;
++	int count;
++	umode_t smask = current_smask();
++
++	if (!value)
++		return 0;
++	if (size < sizeof(struct posix_acl_xattr_header))
++		return -EINVAL;
++	if (header->a_version != cpu_to_le32(POSIX_ACL_XATTR_VERSION))
++		return -EOPNOTSUPP;
++
++	count = posix_acl_xattr_count(size);
++	if (count < 0)
++		return -EINVAL;
++	if (count == 0)
++		return 0;
++
++	for (end = entry + count; entry != end; entry++) {
++		switch(le16_to_cpu(entry->e_tag)) {
++			case ACL_USER_OBJ:
++			case ACL_USER:
++				entry->e_perm &= ~((smask & S_IRWXU) >> 6);
++				break;
++			case ACL_GROUP_OBJ:
++			case ACL_GROUP:
++				entry->e_perm &= ~((smask & S_IRWXG) >> 3);
++				break;
++			case ACL_OTHER:
++				entry->e_perm &= ~(smask & S_IRWXO);
++				break;
++			default:
++				break;
++		}
++	}
++	return 0;
++}
++
+ /*
+  * Convert from extended attribute to in-memory representation.
+  */
+--- linux-5.10.126/fs/proc/base.c	2022-06-28 18:14:39.769736068 -0400
++++ linux-5.10.126/fs/proc/base.c	2022-06-28 18:21:58.277725222 -0400
+@@ -2596,6 +2596,92 @@ static const struct file_operations proc
+ 	.release	= single_release,
+ };
+ 
++static ssize_t smask_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
++{
++	struct inode *inode = file_inode(file);
++	struct task_struct *p;
++	int mask;
++	int err;
++
++	err = kstrtoint_from_user(buf, count, 8, &mask);
++	if (err < 0)
++		return err;
++
++	mask &= S_IRWXUGO;
++
++	p = get_proc_task(inode);
++	if (!p)
++		return -ESRCH;
++
++	if (p != current) {
++		if (!ptrace_may_access(p, PTRACE_MODE_READ_FSCREDS)) {
++			count = -EPERM;
++			goto out;
++		}
++	}
++
++	task_lock(p);
++	if (p->fs) {
++		spin_lock(&p->fs->lock);
++		// are we trying to unmask a bit?
++		if ((p->fs->smask & ~mask) && !capable(CAP_FOWNER)) {
++			count = -EPERM;
++		}
++		else {
++			p->fs->smask = mask;
++			p->fs->umask |= mask;
++		}
++		spin_unlock(&p->fs->lock);
++	}
++	else
++		count = -ENOENT;
++
++	task_unlock(p);
++
++out:
++	put_task_struct(p);
++
++	return count;
++}
++
++static int smask_show(struct seq_file *m, void *v)
++{
++	struct inode *inode = m->private;
++	struct task_struct *p;
++	int err = 0, smask;
++
++	p = get_proc_task(inode);
++	if (!p)
++		return -ESRCH;
++
++	task_lock(p);
++	if (p->fs)
++		smask = p->fs->smask;
++	else
++		err = -ENOENT;
++	task_unlock(p);
++
++	if (err == 0)
++		seq_printf(m, "%#04o\n", smask);
++
++	put_task_struct(p);
++
++	return err;
++}
++
++static int smask_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, smask_show, inode);
++}
++
++static const struct file_operations proc_pid_set_smask_operations = {
++	.open		= smask_open,
++	.read		= seq_read,
++	.write		= smask_write,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
+ static struct dentry *proc_pident_instantiate(struct dentry *dentry,
+ 	struct task_struct *task, const void *ptr)
+ {
+@@ -3267,6 +3355,7 @@ static const struct pid_entry tgid_base_
+ 	REG("timers",	  S_IRUGO, proc_timers_operations),
+ #endif
+ 	REG("timerslack_ns", S_IRUGO|S_IWUGO, proc_pid_set_timerslack_ns_operations),
++	REG("smask", S_IRUGO|S_IWUGO, proc_pid_set_smask_operations),
+ #ifdef CONFIG_LIVEPATCH
+ 	ONE("patch_state",  S_IRUSR, proc_pid_patch_state),
+ #endif
+--- linux-5.10.126/fs/xattr.c	2022-06-28 18:22:47.073724015 -0400
++++ linux-5.10.126/fs/xattr.c	2022-06-28 18:24:27.493721531 -0400
+@@ -535,8 +535,14 @@ setxattr(struct dentry *d, const char __
+ 			goto out;
+ 		}
+ 		if ((strcmp(kname, XATTR_NAME_POSIX_ACL_ACCESS) == 0) ||
+-		    (strcmp(kname, XATTR_NAME_POSIX_ACL_DEFAULT) == 0))
++		    (strcmp(kname, XATTR_NAME_POSIX_ACL_DEFAULT) == 0)) {
+ 			posix_acl_fix_xattr_from_user(kvalue, size);
++			if (!capable(CAP_FOWNER)) {
++				error = posix_acl_restrict_smask_xattr(kvalue, size);
++				if (error < 0)
++					goto out;
++			}
++		}
+ 		else if (strcmp(kname, XATTR_NAME_CAPS) == 0) {
+ 			error = cap_convert_nscap(d, &kvalue, size);
+ 			if (error < 0)
+--- linux-5.10.126/include/linux/fs.h	2022-06-28 18:25:11.149720451 -0400
++++ linux-5.10.126/include/linux/fs.h	2022-06-28 18:25:37.041719811 -0400
+@@ -2326,6 +2326,7 @@ int super_setup_bdi_name(struct super_bl
+ extern int super_setup_bdi(struct super_block *sb);
+ 
+ extern int current_umask(void);
++extern int current_smask(void);
+ 
+ extern void ihold(struct inode * inode);
+ extern void iput(struct inode *);
+--- linux-5.10.126/include/linux/fs_struct.h	2022-06-28 18:26:25.257718618 -0400
++++ linux-5.10.126/include/linux/fs_struct.h	2022-06-28 18:26:38.457718292 -0400
+@@ -11,6 +11,7 @@ struct fs_struct {
+ 	spinlock_t lock;
+ 	seqcount_spinlock_t seq;
+ 	int umask;
++	int smask;
+ 	int in_exec;
+ 	struct path root, pwd;
+ } __randomize_layout;
+--- linux-5.10.126/include/linux/posix_acl_xattr.h	2022-06-28 18:26:59.693717767 -0400
++++ linux-5.10.126/include/linux/posix_acl_xattr.h	2022-06-28 18:27:18.673717297 -0400
+@@ -35,6 +35,7 @@ posix_acl_xattr_count(size_t size)
+ #ifdef CONFIG_FS_POSIX_ACL
+ void posix_acl_fix_xattr_from_user(void *value, size_t size);
+ void posix_acl_fix_xattr_to_user(void *value, size_t size);
++int posix_acl_restrict_smask_xattr(void *value, size_t size);
+ #else
+ static inline void posix_acl_fix_xattr_from_user(void *value, size_t size)
+ {
+--- linux-5.10.126/kernel/sys.c	2022-06-28 18:27:55.177716394 -0400
++++ linux-5.10.126/kernel/sys.c	2022-06-28 18:28:28.813715562 -0400
+@@ -1821,7 +1821,7 @@ COMPAT_SYSCALL_DEFINE2(getrusage, int, w
+ 
+ SYSCALL_DEFINE1(umask, int, mask)
+ {
+-	mask = xchg(&current->fs->umask, mask & S_IRWXUGO);
++	mask = xchg(&current->fs->umask, (mask & S_IRWXUGO) | current_smask());
+ 	return mask;
+ }
+ 
